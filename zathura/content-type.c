@@ -116,6 +116,17 @@ char* zathura_content_type_guess(zathura_content_type_context_t* context, const 
                                  const girara_list_t* supported_content_types) {
   /* try libmagic first */
   g_autofree char* content_type = guess_type_magic(context, path);
+#ifdef __APPLE__
+  /* Launch Services can distinguish document containers that magic calls ZIP. */
+  g_autofree char* zip_type = g_content_type_from_mime_type("application/zip");
+  if (content_type != NULL && g_strcmp0(content_type, zip_type) == 0) {
+    g_autofree char* named_type = guess_type_glib(path);
+    if (named_type != NULL && supported_content_types != NULL &&
+        girara_list_find(supported_content_types, list_cmpstr, named_type) != NULL) {
+      return g_steal_pointer(&named_type);
+    }
+  }
+#endif
   if (content_type != NULL) {
     if (supported_content_types == NULL ||
         girara_list_find(supported_content_types, list_cmpstr, content_type) != NULL) {

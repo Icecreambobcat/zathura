@@ -16,6 +16,14 @@
 #include "zathura.h"
 #include "plugin.h"
 #include "utils.h"
+#ifdef __APPLE__
+#include "document.h"
+#include "commands.h"
+#include "callbacks.h"
+#include "shortcuts.h"
+#include <mach-o/dyld.h>
+#include <gio/gunixinputstream.h>
+#endif
 #ifdef WITH_SECCOMP
 #include "seccomp-filters.h"
 #endif
@@ -26,6 +34,31 @@
 #if defined(WITH_SYNCTEX) && !defined(WITH_SANDBOX)
 #include "dbus-interface.h"
 #include "synctex.h"
+#endif
+
+#ifdef __APPLE__
+/* Silence this GTK warning without hiding other diagnostics. */
+static GLogWriterOutput filter_skipped_frame_warning(GLogLevelFlags level, const GLogField* fields,
+                                                    gsize n_fields, gpointer user_data) {
+  const char* domain = NULL;
+  const char* message = NULL;
+  for (gsize i = 0; i < n_fields; ++i) {
+    if (fields[i].length != -1) {
+      continue;
+    }
+    if (g_strcmp0(fields[i].key, "GLIB_DOMAIN") == 0) {
+      domain = fields[i].value;
+    } else if (g_strcmp0(fields[i].key, "MESSAGE") == 0) {
+      message = fields[i].value;
+    }
+  }
+  if ((level & G_LOG_LEVEL_MASK) == G_LOG_LEVEL_WARNING && !(level & G_LOG_FLAG_FATAL) &&
+      g_strcmp0(domain, "Gdk") == 0 &&
+      g_strcmp0(message, "gdk_frame_timings_presented() called on skipped frame.") == 0) {
+    return G_LOG_WRITER_HANDLED;
+  }
+  return g_log_writer_default(level, fields, n_fields, user_data);
+}
 #endif
 
 #if defined(WITH_SYNCTEX) && !defined(WITH_SANDBOX)
@@ -139,6 +172,7 @@ typedef struct {
   zathura_t* zathura;
 } zathura_app_ctx_t;
 
+#ifndef __APPLE__
 static void cb_app_startup(GApplication* app, gpointer data) {
   zathura_app_ctx_t* ctx = data;
 
@@ -199,6 +233,8 @@ static void cb_app_shutdown(GApplication* UNUSED(app), gpointer data) {
   }
 }
 
+#endif
+
 static GStrv build_argv_for_child(int idx, char** argv, int argc, char** orig_argv, int orig_argc, int file_idx_base) {
   GPtrArray* arr = g_ptr_array_new();
   g_ptr_array_add(arr, g_strdup(orig_argv[0]));
@@ -207,7 +243,7 @@ static GStrv build_argv_for_child(int idx, char** argv, int argc, char** orig_ar
       continue;
     }
     bool is_file = false;
-    for (int j = 0; j < argc - file_idx_base && !is_file; j++) {
+    for (int j = 0; idx >= 0 && j < argc - file_idx_base && !is_file; j++) {
       if (!g_strcmp0(orig_argv[i], argv[file_idx_base + j])) {
         is_file = true;
       }
@@ -230,8 +266,293 @@ static void start_process_group(void* GIRARA_UNUSED(data)) {
   }
 }
 
+#ifdef __APPLE__
+/* Options travel with each open request, not with the host's first document. */
+static void macos_open(GApplication* app, GFile** files, gint count, const gchar* hint, gpointer data) {
+  zathura_app_ctx_t* defaults = data;
+  g_autoptr(GVariant) options = NULL;
+  if (hint && *hint) {
+    options = g_variant_parse(G_VARIANT_TYPE_VARDICT, hint, NULL, NULL, NULL);
+  }
+  zathura_app_ctx_t request = {.plugin_path = defaults->plugin_path, .argv = defaults->argv,
+                               .page_number = ZATHURA_PAGE_NUMBER_UNSPECIFIED};
+  if (options) {
+#define READ_OPTION(name, field) g_variant_lookup(options, name, "&s", &request.field)
+    READ_OPTION("config", config_dir);
+    READ_OPTION("data", data_dir);
+    READ_OPTION("cache", cache_dir);
+    READ_OPTION("plugins", plugin_path);
+    READ_OPTION("editor", synctex_editor);
+    READ_OPTION("password", password);
+    READ_OPTION("synctex", synctex_fwd);
+    READ_OPTION("mode", mode);
+    READ_OPTION("bookmark", bookmark_name);
+    READ_OPTION("find", search_string);
+#undef READ_OPTION
+    g_variant_lookup(options, "page", "i", &request.page_number);
+  }
+
+  for (int i = 0; i < count; ++i) {
+    g_autofree char* path = g_file_get_path(files[i]);
+    if (!path) {
+      path = g_file_get_uri(files[i]);
+    }
+    zathura_t* viewer = NULL;
+    zathura_t* empty = NULL;
+    for (GList* item = gtk_application_get_windows(GTK_APPLICATION(app)); item; item = item->next) {
+      zathura_t* candidate = g_object_get_data(item->data, "zathura-session");
+      if (!candidate || g_object_get_data(item->data, "zathura-closing")) {
+        continue;
+      }
+      if (zathura_has_document(candidate)) {
+        g_autoptr(GFile) current = g_file_new_for_path(zathura_document_get_path(candidate->document));
+        if (g_file_equal(current, files[i])) {
+          viewer = candidate;
+          break;
+        }
+      } else if (!g_object_get_data(item->data, "zathura-opening")) {
+        empty = candidate;
+      } else if (g_strcmp0(g_object_get_data(item->data, "zathura-opening"), path) == 0) {
+        viewer = candidate;
+        break;
+      }
+    }
+    /* Only reuse a blank window when no custom session directories were supplied. */
+    if (!viewer && empty && !request.config_dir && !request.data_dir && !request.cache_dir) {
+      viewer = empty;
+    }
+    if (!viewer) {
+      viewer = init_zathura(request.config_dir, request.data_dir, request.cache_dir,
+                            request.plugin_path, defaults->argv, request.synctex_editor);
+      if (!viewer) {
+        girara_error("Could not initialise document window.");
+        continue;
+      }
+      GtkWindow* window = GTK_WINDOW(viewer->ui.session->gtk.window);
+      g_object_set_data(G_OBJECT(window), "zathura-session", viewer);
+      gtk_application_add_window(GTK_APPLICATION(app), window);
+    }
+    if (request.synctex_editor) {
+      girara_setting_set(viewer->ui.session, "synctex-editor-command", request.synctex_editor);
+    }
+    GtkWindow* window = GTK_WINDOW(viewer->ui.session->gtk.window);
+    const char* cwd = NULL;
+    if (options) {
+      g_variant_lookup(options, "cwd", "&s", &cwd);
+    }
+    if (cwd || !g_object_get_data(G_OBJECT(window), "zathura-cwd")) {
+      g_object_set_data_full(G_OBJECT(window), "zathura-cwd",
+                              cwd ? g_strdup(cwd) : g_path_get_dirname(path), g_free);
+    }
+    if (!zathura_has_document(viewer) && !g_object_get_data(G_OBJECT(window), "zathura-opening")) {
+      g_object_set_data_full(G_OBJECT(window), "zathura-opening", g_strdup(path), g_free);
+      g_auto(GStrv) temporary = NULL;
+      if (options && g_variant_lookup(options, "temporary-files", "^as", &temporary) &&
+          g_strv_contains((const gchar* const*)temporary, path)) {
+        viewer->stdin_support.file = g_strdup(path);
+      }
+      document_open_idle(viewer, path, request.password,
+                          request.page_number > 0 ? request.page_number - 1 : request.page_number,
+                          request.mode, request.synctex_fwd, request.bookmark_name, request.search_string);
+    } else if (zathura_has_document(viewer)) {
+      if (request.synctex_fwd) {
+        int line = 0, column = 0;
+        g_autofree char* input = NULL;
+        if (synctex_parse_input(request.synctex_fwd, &input, &line, &column)) {
+          synctex_view(viewer, input, line, column);
+        }
+      } else if (request.page_number != ZATHURA_PAGE_NUMBER_UNSPECIFIED) {
+        int page = request.page_number > 0 ? request.page_number - 1 : request.page_number;
+        if (page < 0) {
+          page += zathura_document_get_number_of_pages(viewer->document);
+        }
+        page_set(viewer, page);
+      }
+      if (request.search_string) {
+        girara_argument_t argument = {.n = FORWARD};
+        cmd_search(viewer->ui.session, request.search_string, &argument);
+      }
+    }
+    if (!zathura_has_document(viewer) && request.synctex_fwd) {
+      g_object_set_data_full(G_OBJECT(window), "zathura-pending-forward",
+                              g_strdup(request.synctex_fwd), g_free);
+    }
+    gtk_window_present(window);
+  }
+}
+
+static void macos_activate(GApplication* app, gpointer data) {
+  GtkWindow* window = gtk_application_get_active_window(GTK_APPLICATION(app));
+  if (!window) {
+    zathura_app_ctx_t* ctx = data;
+    zathura_t* viewer = init_zathura(ctx->config_dir, ctx->data_dir, ctx->cache_dir,
+                                    ctx->plugin_path, ctx->argv, ctx->synctex_editor);
+    if (!viewer) {
+      return;
+    }
+    window = GTK_WINDOW(viewer->ui.session->gtk.window);
+    g_object_set_data(G_OBJECT(window), "zathura-session", viewer);
+    gtk_application_add_window(GTK_APPLICATION(app), window);
+  }
+  gtk_window_present(window);
+}
+
+static void macos_shutdown(GApplication* app, gpointer UNUSED(data)) {
+  while (gtk_application_get_windows(GTK_APPLICATION(app))) {
+    GtkWindow* window = gtk_application_get_windows(GTK_APPLICATION(app))->data;
+    zathura_t* viewer = g_object_get_data(G_OBJECT(window), "zathura-session");
+    if (viewer) {
+      zathura_free(viewer);
+    } else {
+      gtk_window_destroy(window);
+    }
+  }
+}
+
+static void macos_action(GSimpleAction* action, GVariant* UNUSED(parameter), gpointer data) {
+  GtkApplication* app = data;
+  if (g_strcmp0(g_action_get_name(G_ACTION(action)), "quit") == 0) {
+    g_application_quit(G_APPLICATION(app));
+  } else {
+    GtkWindow* window = gtk_application_get_active_window(app);
+    if (window) {
+      gtk_window_close(window);
+    }
+  }
+}
+
+static void macos_startup(GApplication* app, gpointer UNUSED(data)) {
+  const GActionEntry actions[] = {
+      {.name = "quit", .activate = macos_action},
+      {.name = "close", .activate = macos_action},
+  };
+  g_action_map_add_action_entries(G_ACTION_MAP(app), actions, G_N_ELEMENTS(actions), app);
+  const char* quit_keys[] = {"<Meta>q", NULL};
+  const char* close_keys[] = {"<Meta>w", NULL};
+  gtk_application_set_accels_for_action(GTK_APPLICATION(app), "app.quit", quit_keys);
+  gtk_application_set_accels_for_action(GTK_APPLICATION(app), "app.close", close_keys);
+  g_autoptr(GMenu) menu = g_menu_new();
+  g_autoptr(GMenu) application_menu = g_menu_new();
+  g_menu_append(application_menu, "Close Window", "app.close");
+  g_menu_append(application_menu, "Quit Zathura", "app.quit");
+  g_menu_append_submenu(menu, "Zathura", G_MENU_MODEL(application_menu));
+  gtk_application_set_menubar(GTK_APPLICATION(app), G_MENU_MODEL(menu));
+}
+
+static int macos_command_line(GApplication* UNUSED(app), GApplicationCommandLine* UNUSED(command),
+                               gpointer UNUSED(data)) {
+  /* The validated request was already delivered by g_application_open(). */
+  return 0;
+}
+
+static int run_macos_application(zathura_app_ctx_t* ctx, int count, char** paths) {
+  GVariantBuilder builder;
+  g_variant_builder_init(&builder, G_VARIANT_TYPE_VARDICT);
+#define ADD_OPTION(name, field) \
+  if (ctx->field) g_variant_builder_add(&builder, "{sv}", name, g_variant_new_string(ctx->field))
+  ADD_OPTION("config", config_dir);
+  ADD_OPTION("data", data_dir);
+  ADD_OPTION("cache", cache_dir);
+  ADD_OPTION("plugins", plugin_path);
+  ADD_OPTION("editor", synctex_editor);
+  ADD_OPTION("password", password);
+  ADD_OPTION("synctex", synctex_fwd);
+  ADD_OPTION("mode", mode);
+  ADD_OPTION("bookmark", bookmark_name);
+  ADD_OPTION("find", search_string);
+#undef ADD_OPTION
+  g_variant_builder_add(&builder, "{sv}", "page", g_variant_new_int32(ctx->page_number));
+  g_autofree char* cwd = g_get_current_dir();
+  g_variant_builder_add(&builder, "{sv}", "cwd", g_variant_new_string(cwd));
+
+  GVariantBuilder temporary;
+  g_variant_builder_init(&temporary, G_VARIANT_TYPE_STRING_ARRAY);
+  g_autoptr(GPtrArray) files = g_ptr_array_new_with_free_func(g_object_unref);
+  for (int i = 0; i < count; ++i) {
+    if (g_strcmp0(paths[i], "-") == 0) {
+      g_autoptr(GFileIOStream) stream = NULL;
+      g_autoptr(GFile) file = g_file_new_tmp("zathura.stdin.XXXXXX", &stream, NULL);
+      g_autoptr(GInputStream) input = g_unix_input_stream_new(STDIN_FILENO, FALSE);
+      if (!file || g_output_stream_splice(g_io_stream_get_output_stream(G_IO_STREAM(stream)), input,
+                                           G_OUTPUT_STREAM_SPLICE_CLOSE_TARGET, NULL, NULL) < 0) {
+        girara_error("Could not spool standard input.");
+        return 1;
+      }
+      g_ptr_array_add(files, g_object_ref(file));
+      g_autofree char* temporary_path = g_file_get_path(file);
+      g_variant_builder_add(&temporary, "s", temporary_path);
+    } else {
+      g_ptr_array_add(files, g_file_new_for_commandline_arg(paths[i]));
+    }
+  }
+  g_variant_builder_add(&builder, "{sv}", "temporary-files", g_variant_builder_end(&temporary));
+  g_autoptr(GVariant) options = g_variant_ref_sink(g_variant_builder_end(&builder));
+  g_autofree char* hint = g_variant_print(options, TRUE);
+  g_autoptr(GtkApplication) app = gtk_application_new("org.pwmt.zathura", G_APPLICATION_HANDLES_OPEN | G_APPLICATION_HANDLES_COMMAND_LINE);
+  g_signal_connect(app, "command-line", G_CALLBACK(macos_command_line), ctx);
+  g_signal_connect(app, "startup", G_CALLBACK(macos_startup), ctx);
+  g_signal_connect(app, "activate", G_CALLBACK(macos_activate), ctx);
+  g_signal_connect(app, "open", G_CALLBACK(macos_open), ctx);
+  g_signal_connect(app, "shutdown", G_CALLBACK(macos_shutdown), ctx);
+  g_autoptr(GError) error = NULL;
+  if (!g_application_register(G_APPLICATION(app), NULL, &error)) {
+    girara_error("Could not register application: %s", error->message);
+    return 1;
+  }
+  if (files->len) {
+    g_application_open(G_APPLICATION(app), (GFile**)files->pdata, files->len, hint);
+  } else {
+    g_application_activate(G_APPLICATION(app));
+  }
+  char* run_argv[] = {ctx->argv[0], NULL};
+  return g_application_run(G_APPLICATION(app), 1, run_argv);
+}
+
+/* Keep the actual Mach-O viewer as CFBundleExecutable, even for CLI launches. */
+static void macos_bootstrap(int argc, char** argv) {
+  char executable[PATH_MAX];
+  uint32_t size = sizeof(executable);
+  if (_NSGetExecutablePath(executable, &size) != 0) {
+    return;
+  }
+  g_autofree char* resolved = realpath(executable, NULL);
+  if (!resolved) {
+    return;
+  }
+  g_autofree char* directory = g_path_get_dirname(resolved);
+  g_autofree char* launcher = g_build_filename(directory, "../Resources/launcher.py", NULL);
+  if (!g_file_test(launcher, G_FILE_TEST_IS_EXECUTABLE)) {
+    return;
+  }
+  g_autofree char** args = g_new0(char*, argc + 1);
+  args[0] = launcher;
+  for (int i = 1; i < argc; ++i) {
+    args[i] = argv[i];
+  }
+  g_autofree char* environment = NULL;
+  g_autoptr(GError) error = NULL;
+  int status = 0;
+  if (!g_spawn_sync(NULL, args, NULL, 0, NULL, NULL, &environment, NULL, &status, &error) ||
+      !g_spawn_check_wait_status(status, &error)) {
+    g_printerr("Zathura runtime setup: %s\n", error->message);
+    exit(EXIT_FAILURE);
+  }
+  for (char* entry = environment; *entry; entry += strlen(entry) + 1) {
+    char* separator = strchr(entry, '=');
+    if (separator) {
+      g_autofree char* key = g_strndup(entry, separator - entry);
+      g_setenv(key, separator + 1, TRUE);
+    }
+  }
+}
+#endif
+
 /* main function */
 GIRARA_VISIBLE int main(int argc, char* argv[]) {
+#ifdef __APPLE__
+  macos_bootstrap(argc, argv);
+  g_log_set_writer_func(filter_skipped_frame_warning, NULL, NULL);
+#endif
   init_locale();
 
 #ifdef WITH_SANDBOX
@@ -304,11 +625,23 @@ GIRARA_VISIBLE int main(int argc, char* argv[]) {
     return -1;
   }
 
+#ifdef __APPLE__
+  if (!plugin_path) {
+    plugin_path = g_strdup(g_getenv("ZATHURA_PLUGIN_PATH"));
+  }
+  if (!synctex_editor) {
+    synctex_editor = g_strdup(g_getenv("ZATHURA_SYNCTEX_EDITOR"));
+  }
+#endif
   girara_set_log_level_from_string(loglevel);
 
 #if defined(WITH_SYNCTEX) && !defined(WITH_SANDBOX)
-  /* handle synctex forward synchronization */
-  if (synctex_fwd) {
+  /* macOS routes ordinary forward searches through the document host. */
+  if (synctex_fwd
+#ifdef __APPLE__
+      && synctex_pid != -1
+#endif
+  ) {
     if (argc != 2) {
       girara_error("Too many arguments or missing filename while running with "
                    "--synctex-forward");
@@ -349,6 +682,7 @@ GIRARA_VISIBLE int main(int argc, char* argv[]) {
   const int file_idx_base    = has_double_dash ? 2 : 1;
 
   int file_idx = argc > file_idx_base ? file_idx_base : 0;
+#ifndef __APPLE__
   /* If more than one file, fork an instance for each. */
   if (!print_version && argc > file_idx_base + 1) {
     g_autoptr(girara_list_t) child_pids = girara_list_new();
@@ -375,9 +709,16 @@ GIRARA_VISIBLE int main(int argc, char* argv[]) {
     return 0;
   }
 
+#endif
+
   /* Fork into the background if the user really wants to ... */
   if (!print_version && forkback && file_idx < file_idx_base + 1) {
-    g_auto(GStrv) spawn_argv = build_argv_for_child(file_idx, argv, argc, orig_argv, orig_argc, file_idx_base);
+#ifdef __APPLE__
+    const int child_file = -1; /* Forward all files to the shared host. */
+#else
+    const int child_file = file_idx;
+#endif
+    g_auto(GStrv) spawn_argv = build_argv_for_child(child_file, argv, argc, orig_argv, orig_argc, file_idx_base);
     if (!g_spawn_async(NULL, spawn_argv, NULL, G_SPAWN_DEFAULT | G_SPAWN_SEARCH_PATH, start_process_group, NULL, NULL,
                        &error)) {
       girara_error("Could not spawn: %s", error->message);
@@ -430,6 +771,9 @@ GIRARA_VISIBLE int main(int argc, char* argv[]) {
       .zathura        = NULL,
   };
 
+#ifdef __APPLE__
+  return run_macos_application(&ctx, argc - file_idx_base, argv + file_idx_base);
+#else
   /* a NULL application id keeps the process non-unique and skips D-Bus registration */
   g_autoptr(GtkApplication) app = gtk_application_new(NULL, G_APPLICATION_NON_UNIQUE | G_APPLICATION_HANDLES_OPEN);
   g_signal_connect(app, "startup", G_CALLBACK(cb_app_startup), &ctx);
@@ -447,4 +791,5 @@ GIRARA_VISIBLE int main(int argc, char* argv[]) {
   }
 
   return g_application_run(G_APPLICATION(app), run_argc, run_argv);
+#endif
 }

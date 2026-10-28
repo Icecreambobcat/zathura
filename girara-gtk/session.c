@@ -292,13 +292,33 @@ girara_session_t* girara_session_create(void) {
   return session;
 }
 
+#ifdef __APPLE__
+static void macos_compute_size(GdkToplevel* toplevel, GdkToplevelSize* size, gpointer UNUSED(data)) {
+  GdkSurface* surface = GDK_SURFACE(toplevel);
+  if (gdk_surface_get_mapped(surface)) {
+    /* An AX resize updates the native surface before GtkWindow remembers it.
+     * Do not replace the window manager's size with that stale default. */
+    gdk_toplevel_size_set_size(size, gdk_surface_get_width(surface), gdk_surface_get_height(surface));
+  }
+}
+
+static void macos_window_realized(GtkWidget* window, gpointer UNUSED(data)) {
+  GdkSurface* surface = gtk_native_get_surface(GTK_NATIVE(window));
+  g_signal_connect_object(surface, "compute-size", G_CALLBACK(macos_compute_size), window, G_CONNECT_AFTER);
+}
+#endif
+
 bool girara_session_init(girara_session_t* session, const char* sessionname) {
   if (!session || !sessionname) {
     return false;
   }
 
   /* set session name */
+#ifdef __APPLE__
+  session->private_data->session_name = g_strdup_printf("%s-%p", sessionname, (void*)session);
+#else
   session->private_data->session_name = g_strdup(sessionname);
+#endif
 
   /* load CSS style */
   fill_template_with_values(session);
@@ -306,6 +326,9 @@ bool girara_session_init(girara_session_t* session, const char* sessionname) {
 
   /* window */
   session->gtk.window = gtk_window_new();
+#ifdef __APPLE__
+  g_signal_connect(session->gtk.window, "realize", G_CALLBACK(macos_window_realized), NULL);
+#endif
   gtk_widget_set_name(session->gtk.window, session->private_data->session_name);
 
   /* apply CSS style */
@@ -424,6 +447,10 @@ static void girara_session_private_free(girara_session_private_t* session) {
   session->buffer.command = NULL;
 
   /* clean up CSS style provider */
+  if (session->gtk.cssprovider) {
+    gtk_style_context_remove_provider_for_display(gdk_display_get_default(),
+                                                   GTK_STYLE_PROVIDER(session->gtk.cssprovider));
+  }
   g_clear_object(&session->gtk.cssprovider);
   g_clear_object(&session->csstemplate);
 

@@ -218,8 +218,11 @@ static bool init_ui(zathura_t* zathura) {
   gtk_widget_add_controller(GTK_WIDGET(zathura->ui.session->gtk.view), GTK_EVENT_CONTROLLER(drop_target));
 
   /* zathura signals */
-  zathura->signals.refresh_view = g_signal_new("refresh-view", GTK_TYPE_WIDGET, G_SIGNAL_RUN_LAST, 0, NULL, NULL,
-                                               g_cclosure_marshal_generic, G_TYPE_NONE, 1, G_TYPE_POINTER);
+  zathura->signals.refresh_view = g_signal_lookup("refresh-view", GTK_TYPE_WIDGET);
+  if (!zathura->signals.refresh_view) {
+    zathura->signals.refresh_view = g_signal_new("refresh-view", GTK_TYPE_WIDGET, G_SIGNAL_RUN_LAST, 0, NULL, NULL,
+                                                 g_cclosure_marshal_generic, G_TYPE_NONE, 1, G_TYPE_POINTER);
+  }
 
   g_signal_connect(G_OBJECT(zathura->ui.session->gtk.view), "refresh-view", G_CALLBACK(cb_refresh_view), zathura);
 
@@ -301,8 +304,13 @@ static bool init_ui(zathura_t* zathura) {
   girara_statusbar_item_set_text(zathura->ui.statusbar.file, _("[No name]"));
 
   /* signals */
+#ifdef __APPLE__
+  const char* close_signal = "close-request";
+#else
+  const char* close_signal = "destroy";
+#endif
   zathura->signals.destroy_handler =
-      g_signal_connect(G_OBJECT(zathura->ui.session->gtk.window), "destroy", G_CALLBACK(cb_destroy), zathura);
+      g_signal_connect(G_OBJECT(zathura->ui.session->gtk.window), close_signal, G_CALLBACK(cb_destroy), zathura);
 
   return true;
 }
@@ -460,6 +468,10 @@ void zathura_free(zathura_t* zathura) {
     return;
   }
 
+  if (zathura->signals.open_document) {
+    g_source_remove(zathura->signals.open_document);
+    zathura->signals.open_document = 0;
+  }
   document_close(zathura, false);
   document_predecessor_free(zathura);
 
@@ -490,6 +502,15 @@ void zathura_free(zathura_t* zathura) {
 
   /* stop D-Bus */
   g_clear_object(&zathura->dbus);
+#ifdef __APPLE__
+  while (g_source_remove_by_user_data(zathura)) {}
+  if (zathura->ui.session && zathura->ui.session->gtk.window) {
+    GtkWindow* window = GTK_WINDOW(zathura->ui.session->gtk.window);
+    g_object_set_data(G_OBJECT(window), "zathura-session", NULL);
+    gtk_window_destroy(window);
+    zathura->ui.session->gtk.window = NULL;
+  }
+#endif
 
   if (zathura->ui.session != NULL) {
     girara_session_destroy(zathura->ui.session);
@@ -694,9 +715,10 @@ static gchar* prepare_document_open_from_gfile(GFile* source) {
 static gboolean document_info_open(gpointer data) {
   g_return_val_if_fail(data != NULL, FALSE);
 
-  g_autoptr(zathura_document_info_t) document_info = data;
+  zathura_document_info_t* document_info = data;
   g_autofree char* uri                             = NULL;
   zathura_t* zathura                               = document_info->zathura;
+  zathura->signals.open_document = 0;
 
   if (zathura != NULL && document_info->path != NULL) {
     g_autofree char* file = NULL;
@@ -740,6 +762,13 @@ static gboolean document_info_open(gpointer data) {
     }
 
     if (file != NULL) {
+#ifdef __APPLE__
+      char* pending = g_object_steal_data(G_OBJECT(zathura->ui.session->gtk.window), "zathura-pending-forward");
+      if (pending) {
+        g_free(document_info->synctex);
+        document_info->synctex = pending;
+      }
+#endif
       if (document_info->synctex != NULL) {
         document_open_synctex(zathura, file, uri, document_info->password, document_info->synctex);
       } else {
@@ -771,6 +800,9 @@ static gboolean document_info_open(gpointer data) {
     }
   }
 
+#ifdef __APPLE__
+  g_object_set_data(G_OBJECT(zathura->ui.session->gtk.window), "zathura-opening", NULL);
+#endif
   return FALSE;
 }
 
@@ -820,15 +852,20 @@ char* get_formatted_filename(zathura_t* zathura, bool statusbar) {
 }
 
 static void cb_document_widget_page_widgets_loaded(ZathuraDocumentWidget* document_widget, zathura_t* zathura) {
-  if (document_widget != zathura->ui.document_widget || zathura->sync.pending_search_input == NULL) {
+  if (document_widget != zathura->ui.document_widget) {
     return;
   }
 
-  char* input                        = zathura->sync.pending_search_input;
-  zathura->sync.pending_search_input = NULL;
-  girara_argument_t argument         = {.n = zathura->sync.pending_search_direction};
-  cmd_search(zathura->ui.session, input, &argument);
-  g_free(input);
+  if (zathura->sync.pending_search_input != NULL) {
+    g_autofree char* input      = g_steal_pointer(&zathura->sync.pending_search_input);
+    girara_argument_t argument = {.n = zathura->sync.pending_search_direction};
+    cmd_search(zathura->ui.session, input, &argument);
+  }
+
+  if (zathura->sync.pending_synctex_input != NULL) {
+    g_autofree char* input = g_steal_pointer(&zathura->sync.pending_synctex_input);
+    synctex_view(zathura, input, zathura->sync.pending_synctex_line, zathura->sync.pending_synctex_column);
+  }
 }
 
 static bool document_widget_create(zathura_t* zathura, zathura_document_t* document, unsigned int page_v_padding,
@@ -939,6 +976,9 @@ bool document_open(zathura_t* zathura, const char* path, const char* uri, const 
   }
 
   g_return_val_if_fail(zathura->document == NULL, false);
+
+  /* Notices from the previous document or blank window no longer apply. */
+  gtk_widget_set_visible(zathura->ui.session->gtk.notification_area, FALSE);
 
   /* FIXME: since there are many call chains leading here, check again if we need to expand ~ or
    * ~user. We should fix all call sites instead */
@@ -1338,7 +1378,11 @@ void document_open_idle(zathura_t* zathura, const char* path, const char* passwo
   document_info->search_string = g_strdup(search_string);
   document_info->page_number   = page_number;
 
-  g_idle_add(document_info_open, document_info);
+  if (zathura->signals.open_document) {
+    g_source_remove(zathura->signals.open_document);
+  }
+  zathura->signals.open_document = g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, document_info_open, document_info,
+                                                   (GDestroyNotify)free_document_info);
 }
 
 bool document_save(zathura_t* zathura, const char* path, bool overwrite) {
@@ -1465,6 +1509,7 @@ bool document_close(zathura_t* zathura, bool keep_monitor) {
   }
   g_free(zathura->sync.pending_search_input);
   zathura->sync.pending_search_input = NULL;
+  g_clear_pointer(&zathura->sync.pending_synctex_input, g_free);
 
   /* drop a first render hold that never got released */
   initial_render_cancel_hold(zathura);

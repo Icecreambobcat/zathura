@@ -27,7 +27,27 @@
 #include "synctex.h"
 #include "dbus-interface.h"
 
+#ifdef __APPLE__
+static gboolean close_window_idle(gpointer data) {
+  zathura_free(data);
+  return G_SOURCE_REMOVE;
+}
+#endif
+
 gboolean cb_destroy(GtkWidget* widget, zathura_t* zathura) {
+#ifdef __APPLE__
+  (void)widget;
+  if (zathura && zathura->ui.session && zathura->ui.session->gtk.window) {
+    GtkWidget* window = zathura->ui.session->gtk.window;
+    if (!g_object_get_data(G_OBJECT(window), "zathura-closing")) {
+      g_object_set_data(G_OBJECT(window), "zathura-closing", GINT_TO_POINTER(1));
+      gtk_widget_set_visible(window, FALSE);
+      /* Let already queued UI callbacks unwind before disposing their session. */
+      g_idle_add_full(G_PRIORITY_LOW + 20, close_window_idle, zathura, NULL);
+    }
+  }
+  return TRUE;
+#else
   /* hide the window on quit while the cleanup runs */
   if (widget == NULL && zathura != NULL && zathura->ui.session != NULL && zathura->ui.session->gtk.window != NULL) {
     gtk_widget_set_visible(zathura->ui.session->gtk.window, FALSE);
@@ -53,6 +73,7 @@ gboolean cb_destroy(GtkWidget* widget, zathura_t* zathura) {
   }
 
   return TRUE;
+#endif
 }
 
 void cb_buffer_changed(girara_session_t* session) {

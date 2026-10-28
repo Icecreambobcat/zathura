@@ -132,6 +132,9 @@ struct zathura_s {
     GObject* initial_render_instance; /**< instance the release handler is connected to */
     char* pending_search_input;       /**< search query received before the widgets finished loading */
     int pending_search_direction;     /**< direction for a search received before loading finished */
+    char* pending_synctex_input;      /**< SyncTeX source received before the widgets finished loading */
+    unsigned int pending_synctex_line;
+    unsigned int pending_synctex_column;
   } sync;
 
   struct {
@@ -179,6 +182,7 @@ struct zathura_s {
 
   struct {
     guint refresh_view;
+    guint open_document; /**< Pending document-open source, cancelled on close */
 #ifdef G_OS_UNIX
     guint sigterm;
 #endif

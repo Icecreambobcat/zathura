@@ -62,7 +62,18 @@ bool synctex_get_input_line_column(zathura_t* zathura, const char* filename, uns
     synctex_node_p node = synctex_scanner_next_result(scanner);
     if (node) {
       if (input_file) {
-        *input_file = g_strdup(synctex_scanner_get_name(scanner, synctex_node_tag(node)));
+        const char* source = synctex_scanner_get_name(scanner, synctex_node_tag(node));
+#ifdef __APPLE__
+        const char* cwd = g_object_get_data(G_OBJECT(zathura->ui.session->gtk.window), "zathura-cwd");
+        g_autofree char* directory = g_path_get_dirname(filename);
+        *input_file = source ? g_canonicalize_filename(source, cwd ? cwd : directory) : NULL;
+        if (source && !g_path_is_absolute(source) && !g_file_test(*input_file, G_FILE_TEST_EXISTS)) {
+          g_free(*input_file);
+          *input_file = g_canonicalize_filename(source, directory);
+        }
+#else
+        *input_file = g_strdup(source);
+#endif
       }
       if (line) {
         *line = synctex_node_line(node);
@@ -342,10 +353,21 @@ bool synctex_view(zathura_t* zathura, const char* input_file, unsigned int line,
     return false;
   }
 
-  zathura_document_t* document       = zathura_get_document(zathura);
-  const unsigned int number_of_pages = zathura_document_get_number_of_pages(document);
+  zathura_document_t* document = zathura_get_document(zathura);
+  if (document == NULL) {
+    return false;
+  }
 
-  unsigned int page                        = 0;
+  if (!zathura_document_widget_page_widgets_loaded(zathura->ui.document_widget)) {
+    g_free(zathura->sync.pending_synctex_input);
+    zathura->sync.pending_synctex_input  = g_strdup(input_file);
+    zathura->sync.pending_synctex_line   = line;
+    zathura->sync.pending_synctex_column = column;
+    return true;
+  }
+
+  const unsigned int number_of_pages = zathura_document_get_number_of_pages(document);
+  unsigned int page                      = 0;
   g_autoptr(girara_list_t) secondary_rects = NULL;
   g_autoptr(girara_list_t) rectangles      = synctex_rectangles_from_position(
       zathura, zathura_document_get_path(document), input_file, line, column, &page, &secondary_rects);

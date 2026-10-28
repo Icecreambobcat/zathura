@@ -45,7 +45,7 @@ test('utils', utils,
 
 xvfb = find_program('xvfb-run', required: get_option('tests-x11'))
 weston = find_program('weston', required: get_option('tests-wayland'))
-if xvfb.found() or weston.found()
+if xvfb.found() or weston.found() or host_machine.system() == 'darwin'
   session = executable('test_session', files('test_session.c'),
     dependencies: build_dependencies + test_dependencies,
     include_directories: include_directories,
@@ -112,6 +112,28 @@ if xvfb.found()
       'LIBGL_DEBUG=quiet',
       'EGL_LOG_LEVEL=fatal'
     ]
+  )
+endif
+
+if host_machine.system() == 'darwin'
+  foreach native_test : [[session, 'session'], [config, 'config'], [setting, 'setting']]
+    test('macos_' + native_test[1], native_test[0],
+      timeout: 60,
+      is_parallel: false,
+      protocol: 'tap',
+      env: env
+    )
+  endforeach
+  multiwindow = executable('test_multiwindow', files('test_multiwindow.c'),
+    dependencies: build_dependencies + test_dependencies,
+    include_directories: include_directories,
+    c_args: defines + flags
+  )
+  test('macos_multiwindow', multiwindow,
+    timeout: 60,
+    is_parallel: false,
+    protocol: 'tap',
+    env: env
   )
 endif
 

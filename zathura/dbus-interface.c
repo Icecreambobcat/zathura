@@ -71,6 +71,12 @@ static void finalize(GObject* object) {
     g_dbus_node_info_unref(priv->introspection_data);
   }
 
+#ifdef __APPLE__
+  if (priv->connection) {
+    g_dbus_connection_close_sync(priv->connection, NULL, NULL);
+    g_clear_object(&priv->connection);
+  }
+#endif
   g_free(priv->bus_name);
 
   G_OBJECT_CLASS(zathura_dbus_parent_class)->finalize(object);
@@ -151,10 +157,35 @@ ZathuraDbus* zathura_dbus_new(zathura_t* zathura) {
     return NULL;
   }
 
+#ifdef __APPLE__
+  static unsigned int window_serial;
+  g_autofree char* address = g_dbus_address_get_for_bus_sync(G_BUS_TYPE_SESSION, NULL, &error);
+  if (!address) {
+    return NULL;
+  }
+  GDBusConnection* connection = g_dbus_connection_new_for_address_sync(
+      address, G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT | G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION,
+      NULL, NULL, &error);
+  if (!connection) {
+    girara_warning("Could not connect window to D-Bus: %s", error->message);
+    return NULL;
+  }
+  g_dbus_connection_set_exit_on_close(connection, FALSE);
+  char* well_known_name = window_serial++ == 0 ? g_strdup_printf(DBUS_NAME_TEMPLATE, getpid())
+      : g_strdup_printf("org.pwmt.zathura.PID-%d.Window-%u", getpid(), window_serial);
+#else
   char* well_known_name = g_strdup_printf(DBUS_NAME_TEMPLATE, getpid());
+#endif
   priv->bus_name        = well_known_name;
-  priv->owner_id        = g_bus_own_name(G_BUS_TYPE_SESSION, well_known_name, G_BUS_NAME_OWNER_FLAGS_NONE, bus_acquired,
-                                         name_acquired, name_lost, dbus, NULL);
+#ifdef __APPLE__
+  bus_acquired(connection, well_known_name, dbus);
+  priv->connection = connection;
+  priv->owner_id = g_bus_own_name_on_connection(connection, well_known_name, G_BUS_NAME_OWNER_FLAGS_NONE,
+                                               name_acquired, name_lost, dbus, NULL);
+#else
+  priv->owner_id = g_bus_own_name(G_BUS_TYPE_SESSION, well_known_name, G_BUS_NAME_OWNER_FLAGS_NONE, bus_acquired,
+                                  name_acquired, name_lost, dbus, NULL);
+#endif
 
   // dbus takes ownership of obj
   obj = NULL;
@@ -227,43 +258,6 @@ static void handle_goto_page(zathura_t* zathura, GVariant* parameters, GDBusMeth
 
   GVariant* result = g_variant_new("(b)", ret);
   g_dbus_method_invocation_return_value(invocation, result);
-}
-
-typedef struct {
-  zathura_t* zathura;
-  girara_list_t** rectangles;
-  unsigned int page;
-  unsigned int number_of_pages;
-} highlights_rect_data_t;
-
-static gboolean synctex_highlight_rects_impl(gpointer ptr) {
-  highlights_rect_data_t* data = ptr;
-
-  /* synctex_highlight_rects transfers ownership of each rectangles[i] to the
-   * page widget via g_object_set "search-results"; only free the array. */
-  synctex_highlight_rects(data->zathura, data->page, data->rectangles);
-
-  g_free(data->rectangles);
-  g_free(data);
-  return false;
-}
-
-static void synctex_highlight_rects_idle(zathura_t* zathura, girara_list_t** rectangles, unsigned int page,
-                                         unsigned number_of_pages) {
-  highlights_rect_data_t* data = g_try_malloc0(sizeof(highlights_rect_data_t));
-  if (data == NULL) {
-    for (unsigned int i = 0; i != number_of_pages; ++i) {
-      girara_list_free(rectangles[i]);
-    }
-    g_free(rectangles);
-    return;
-  }
-  data->zathura         = zathura;
-  data->rectangles      = rectangles;
-  data->page            = page;
-  data->number_of_pages = number_of_pages;
-
-  g_idle_add(synctex_highlight_rects_impl, data);
 }
 
 static void handle_highlight_rects(zathura_t* zathura, GVariant* parameters, GDBusMethodInvocation* invocation) {
@@ -342,51 +336,22 @@ static void handle_highlight_rects(zathura_t* zathura, GVariant* parameters, GDB
     girara_list_append(rectangles[temp_page], rect);
   }
 
-  /* run synctex_highlight_rects in main thread when idle */
-  synctex_highlight_rects_idle(zathura, rectangles, page, number_of_pages);
+  /* D-Bus vtable callbacks already run in the registering GTK main context.
+   * Do not queue raw document pointers beyond the lifetime of this request. */
+  synctex_highlight_rects(zathura, page, rectangles);
+  g_free(rectangles); /* The page widgets own the individual lists. */
 
   GVariant* result = g_variant_new("(b)", true);
   g_dbus_method_invocation_return_value(invocation, result);
 }
 
-typedef struct {
-  zathura_t* zathura;
-  gchar* input_file;
-  unsigned int line;
-  unsigned int column;
-} view_data_t;
-
-static gboolean synctex_view_impl(gpointer ptr) {
-  view_data_t* data = ptr;
-
-  synctex_view(data->zathura, data->input_file, data->line, data->column);
-
-  g_free(data->input_file);
-  g_free(data);
-  return false;
-}
-
-static void synctex_view_idle(zathura_t* zathura, gchar* input_file, unsigned int line, unsigned int column) {
-  view_data_t* data = g_try_malloc0(sizeof(view_data_t));
-  if (data == NULL) {
-    g_free(input_file);
-    return;
-  }
-  data->zathura    = zathura;
-  data->input_file = input_file;
-  data->line       = line;
-  data->column     = column;
-
-  g_idle_add(synctex_view_impl, data);
-}
-
 static void handle_synctex_view(zathura_t* zathura, GVariant* parameters, GDBusMethodInvocation* invocation) {
-  gchar* input_file = NULL;
+  g_autofree gchar* input_file = NULL;
   guint line        = 0;
   guint column      = 0;
   g_variant_get(parameters, "(suu)", &input_file, &line, &column);
 
-  synctex_view_idle(zathura, input_file, line, column);
+  synctex_view(zathura, input_file, line, column);
 
   GVariant* result = g_variant_new("(b)", true);
   g_dbus_method_invocation_return_value(invocation, result);
@@ -671,7 +636,12 @@ static int iterate_instances_call_synctex_view(const char* filename, const char*
   if (hint != -1) {
     g_autofree char* well_known_name = g_strdup_printf(DBUS_NAME_TEMPLATE, hint);
     const bool ret = call_synctex_view(connection, filename, well_known_name, input_file, line, column);
-    return ret ? 1 : -1;
+    if (ret) {
+      return 1;
+    }
+#ifndef __APPLE__
+    return -1;
+#endif
   }
 
   g_autoptr(GVariant) vnames = g_dbus_connection_call_sync(
@@ -691,12 +661,20 @@ static int iterate_instances_call_synctex_view(const char* filename, const char*
     if (!g_str_has_prefix(name, "org.pwmt.zathura.PID")) {
       continue;
     }
+#ifdef __APPLE__
+    if (hint != -1) {
+      g_autofree char* prefix = g_strdup_printf("org.pwmt.zathura.PID-%d.Window-", hint);
+      if (!g_str_has_prefix(name, prefix)) {
+        continue;
+      }
+    }
+#endif
     girara_debug("Found name: %s", name);
 
     found_one = call_synctex_view(connection, filename, name, input_file, line, column);
   }
 
-  return found_one ? 1 : 0;
+  return found_one ? 1 : (hint != -1 ? -1 : 0);
 }
 
 int zathura_dbus_synctex_position(const char* filename, const char* input_file, int line, int column, pid_t hint) {
